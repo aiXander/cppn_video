@@ -184,36 +184,63 @@ def render_video(
         color_match_mode=color_match_mode
     )
 
+    # Build network architecture ONCE before processing
+    print("Building network architecture...")
+    generator.network.build_network_architecture(num_layers=num_layers)
+
     # Generate latent trajectory using spline interpolation
     print(f"Generating smooth spline trajectory with {num_keypoints} keypoints...")
     z_trajectory = generate_spline_trajectory(h_size, n_frames, num_keypoints, seed)
 
     print(f"Generated trajectory with {len(z_trajectory)} frames")
 
-    # Generate and save frames to disk
-    print("\nGenerating and saving frames to disk...")
-    for i, z in enumerate(z_trajectory):
-        progress = (i + 1) / len(z_trajectory) * 100
-        print(f"  Frame {i+1}/{len(z_trajectory)} ({progress:.1f}%)...", end='\r')
+    # OPTIMIZED: Use batch processing to generate all frames at once
+    print("\nGenerating frames using batch processing...")
+    print(f"  Processing {len(z_trajectory)} frames in batches...")
 
-        # Generate frame
-        frame = generator.generate(
+    # Determine batch size based on available memory
+    # For 1920x1080, process ~10-20 frames at a time to avoid OOM
+    pixels_per_frame = width * height
+    if pixels_per_frame > 1_500_000:  # > ~1080p
+        batch_size = 10
+    elif pixels_per_frame > 500_000:  # ~720p
+        batch_size = 20
+    else:  # Lower resolutions
+        batch_size = 50
+
+    batch_size = min(batch_size, len(z_trajectory))
+    print(f"  Batch size: {batch_size} frames")
+
+    # Process in batches and save
+    for batch_start in range(0, len(z_trajectory), batch_size):
+        batch_end = min(batch_start + batch_size, len(z_trajectory))
+        z_batch = z_trajectory[batch_start:batch_end]
+
+        progress = batch_end / len(z_trajectory) * 100
+        print(f"  Processing frames {batch_start+1}-{batch_end}/{len(z_trajectory)} ({progress:.1f}%)...")
+
+        # Generate batch of frames
+        frames_batch = generator.generate_batch(
             width=width,
             height=height,
-            z=z,
+            z_batch=z_batch,
             num_layers=num_layers
         )
 
-        # Process and save frame as JPEG
-        img_data = 1 - frame if invert else frame
-        img_data = np.clip(img_data * 255, 0, 255).astype(np.uint8)
+        # Save each frame in the batch
+        for i, frame in enumerate(frames_batch):
+            frame_idx = batch_start + i
 
-        # Save as JPEG
-        frame_path = frames_dir / f"frame_{i:06d}.jpg"
-        img = Image.fromarray(img_data)
-        img.save(frame_path, 'JPEG', quality=jpeg_quality)
+            # Process and save frame as JPEG
+            img_data = 1 - frame if invert else frame
+            img_data = np.clip(img_data * 255, 0, 255).astype(np.uint8)
 
-    print(f"\n✓ Generated and saved {len(z_trajectory)} frames to disk")
+            # Save as JPEG
+            frame_path = frames_dir / f"frame_{frame_idx:06d}.jpg"
+            img = Image.fromarray(img_data)
+            img.save(frame_path, 'JPEG', quality=jpeg_quality)
+
+    print(f"✓ Generated and saved {len(z_trajectory)} frames to disk")
 
     # Use ffmpeg to create video
     print(f"\nCreating video with ffmpeg (fps={fps})...")
@@ -281,9 +308,9 @@ def main():
                         help='Number of frames to generate')
     parser.add_argument('--output', type=str, default='cppn_video.mp4',
                         help='Output video file path')
-    parser.add_argument('--width', type=int, default=1920//3,
+    parser.add_argument('--width', type=int, default=1920,
                         help='Video width in pixels')
-    parser.add_argument('--height', type=int, default=1080//3,
+    parser.add_argument('--height', type=int, default=1080,
                         help='Video height in pixels')
     parser.add_argument('--fps', type=int, default=25,
                         help='Frames per second (default: 25)')
@@ -293,7 +320,7 @@ def main():
                         help='JPEG quality for frame storage (1-100, default: 95)')
 
     # Spline parameters
-    parser.add_argument('--num_keypoints', type=int, default=5,
+    parser.add_argument('--num_keypoints', type=int, default=10,
                         help='Number of keypoints for spline trajectory')
 
     # CPPN parameters

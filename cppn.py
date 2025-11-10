@@ -14,6 +14,7 @@ from PIL import Image
 from pathlib import Path
 
 from color_matching import ColorMatcher
+import network_torch
 
 
 class CPPNGenerator:
@@ -63,8 +64,14 @@ class CPPNGenerator:
         # Use a RandomState for reproducibility
         self.rng = np.random.RandomState(seed)
 
-        # Store network weights for consistency
-        self.weights = {}
+        # Initialize the neural network
+        self.network = network_torch.CPPNNetwork(
+            net_size=net_size,
+            h_size=h_size,
+            c_dim=self.c_dim,
+            scaling=scaling,
+            rng=self.rng
+        )
 
         # Initialize color matcher if reference provided
         self.color_matcher = None
@@ -128,99 +135,6 @@ class CPPNGenerator:
 
         return x_flat, y_flat, r_flat
 
-    def _fully_connected(
-        self,
-        x: np.ndarray,
-        out_dim: int,
-        layer_name: str,
-        with_bias: bool = True
-    ) -> np.ndarray:
-        """
-        Apply a fully connected layer with stored weights.
-
-        Args:
-            x: Input array
-            out_dim: Output dimension
-            layer_name: Unique name for this layer (for weight storage)
-            with_bias: Whether to include bias term
-
-        Returns:
-            Output of the layer
-        """
-        in_dim = x.shape[1]
-
-        # Create or retrieve weights
-        weight_key = f"{layer_name}_weight"
-        bias_key = f"{layer_name}_bias"
-
-        if weight_key not in self.weights:
-            self.weights[weight_key] = self.rng.standard_normal(
-                size=(in_dim, out_dim)
-            ).astype(np.float32)
-
-        if with_bias and bias_key not in self.weights:
-            self.weights[bias_key] = self.rng.standard_normal(
-                size=(1, out_dim)
-            ).astype(np.float32)
-
-        result = np.matmul(x, self.weights[weight_key])
-
-        if with_bias:
-            result += self.weights[bias_key]
-
-        return result
-
-    def _sigmoid(self, x: np.ndarray) -> np.ndarray:
-        """Sigmoid activation function."""
-        return 1.0 / (1.0 + np.exp(-x))
-
-    def _softplus(self, x: np.ndarray) -> np.ndarray:
-        """Softplus activation function."""
-        return np.log(1.0 + np.exp(np.clip(x, -20, 20)))
-
-    def _build_network(
-        self,
-        x_coords: np.ndarray,
-        y_coords: np.ndarray,
-        r_coords: np.ndarray,
-        z_vec: np.ndarray,
-        num_layers: int = 3
-    ) -> np.ndarray:
-        """
-        Build the CPPN network.
-
-        Args:
-            x_coords: X coordinates
-            y_coords: Y coordinates
-            r_coords: Radial coordinates
-            z_vec: Latent vector
-            num_layers: Number of hidden layers
-
-        Returns:
-            Network output
-        """
-        num_points = x_coords.shape[0]
-
-        # Expand z_vec to match coordinate dimensions
-        z_expanded = np.tile(z_vec, (num_points, 1)) * self.scaling
-
-        # Initial layer combines all inputs
-        h = (
-            self._fully_connected(z_expanded, self.net_size, "z_input") +
-            self._fully_connected(x_coords, self.net_size, "x_input", with_bias=False) +
-            self._fully_connected(y_coords, self.net_size, "y_input", with_bias=False) +
-            self._fully_connected(r_coords, self.net_size, "r_input", with_bias=False)
-        )
-
-        # Hidden layers with tanh activation
-        h = np.tanh(h)
-        for i in range(num_layers):
-            h = np.tanh(self._fully_connected(h, self.net_size, f"hidden_{i}"))
-
-        # Output layer with sigmoid for [0, 1] range
-        output = self._sigmoid(self._fully_connected(h, self.c_dim, "output"))
-
-        return output
 
     def generate(
         self,
@@ -255,17 +169,11 @@ class CPPNGenerator:
         if z.ndim == 1:
             z = z.reshape(1, -1)
 
-        # Initialize weights only if they don't exist yet
-        # This ensures consistent network across multiple generations
-        if not self.weights:
-            # Weights will be created on first forward pass
-            pass
-
         # Create coordinate grids
         x_coords, y_coords, r_coords = self._create_grid(width, height, scaling)
 
-        # Generate image
-        output = self._build_network(x_coords, y_coords, r_coords, z, num_layers)
+        # Generate image using the network
+        output = self.network.build_network(x_coords, y_coords, r_coords, z, num_layers)
 
         # Reshape to image
         if self.c_dim == 1:
@@ -279,6 +187,67 @@ class CPPNGenerator:
             image = self.color_matcher.apply_color_matching(image, strength=strength)
 
         return image
+
+    def generate_batch(
+        self,
+        width: int,
+        height: int,
+        z_batch: np.ndarray,
+        scaling: Optional[float] = None,
+        num_layers: int = 3,
+        color_match_strength: Optional[float] = None
+    ) -> np.ndarray:
+        """
+        Generate multiple images at once using batch processing (OPTIMIZED FOR VIDEO).
+
+        This is significantly faster for video generation as it:
+        - Builds the network weights only once
+        - Processes all frames in parallel on GPU
+        - Caches coordinate grids across all frames
+
+        Args:
+            width: Image width in pixels
+            height: Image height in pixels
+            z_batch: Batch of latent vectors, shape (batch_size, h_size)
+            scaling: Coordinate scaling (uses default if None)
+            num_layers: Number of hidden layers in the network
+            color_match_strength: Override color matching strength for this generation
+
+        Returns:
+            Generated images as numpy array with shape (batch_size, height, width, channels)
+        """
+        if scaling is None:
+            scaling = self.scaling
+
+        batch_size = z_batch.shape[0]
+
+        # Ensure z_batch is 2D
+        if z_batch.ndim != 2:
+            raise ValueError(f"z_batch must be 2D (batch_size, h_size), got shape {z_batch.shape}")
+
+        # Create coordinate grids ONCE for all frames
+        x_coords, y_coords, r_coords = self._create_grid(width, height, scaling)
+
+        # Optimized batch processing
+        output = self.network.forward_pass_batch(x_coords, y_coords, r_coords, z_batch, num_layers)
+        # output shape: (batch_size, num_points, c_dim)
+
+        # Reshape to images: (batch_size, height, width, channels)
+        if self.c_dim == 1:
+            images = output.reshape(batch_size, height, width)
+        else:
+            images = output.reshape(batch_size, height, width, self.c_dim)
+
+        # Apply color matching if enabled
+        if self.color_matcher is not None and self.c_dim == 3:
+            strength = color_match_strength if color_match_strength is not None else self.color_match_strength
+            # Apply to each image in the batch
+            images = np.stack([
+                self.color_matcher.apply_color_matching(img, strength=strength)
+                for img in images
+            ])
+
+        return images
 
     def save_image(
         self,
