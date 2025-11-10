@@ -1,6 +1,6 @@
 # CPPN Art Generator
 
-Generate mesmerizing abstract art and animations using Compositional Pattern Producing Networks (CPPNs).
+Generate abstract morphing animations using Compositional Pattern Producing Networks (CPPNs).
 
 <p align="center">
   <img src="cppn_example.gif" alt="CPPN Animation Example" width="70%">
