@@ -2,7 +2,7 @@
 
 Generate mesmerizing abstract art and animations using Compositional Pattern Producing Networks (CPPNs).
 
-https://github.com/user-attachments/assets/cppn_example_video.mp4
+![CPPN Animation Example](cppn_example.gif)
 
 ## What is CPPN?
 
